@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.env
+.env.*
+!.env.example
+
+logs/
+checkpoints/
+data/
+
+.DS_Store
+Thumbs.db

@@ -1,0 +1,32 @@
+# ============================================================
+#  docker-compose.yml — Run and manage the bot on VPS
+#
+#  Commands:
+#    Start:   docker-compose up -d
+#    Logs:    docker-compose logs -f
+#    Stop:    docker-compose down
+#    Restart: docker-compose restart
+# ============================================================
+
+version: "3.9"
+
+services:
+  trading-bot:
+    build: .
+    container_name: ml-trading-bot
+    restart: unless-stopped          # Auto-restart if it crashes
+    ports:
+      - "8080:8080"                  # Dashboard
+    volumes:
+      - ./checkpoints:/app/checkpoints   # Model checkpoints persist
+      - ./logs:/app/logs                 # Logs persist
+      - ./data:/app/data                 # Data cache persists
+    environment:
+      - PYTHONUNBUFFERED=1               # See logs in real-time
+    mem_limit: 4g                        # Limit RAM usage
+    cpus: "2.0"                          # Limit CPU
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"

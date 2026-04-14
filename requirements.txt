@@ -1,0 +1,23 @@
+# Core RL
+stable-baselines3[extra]==2.3.2
+gymnasium==0.29.1
+ 
+# Binance WebSocket
+websocket-client==1.8.0
+requests==2.32.3
+ 
+# Numerical
+numpy==1.26.4
+scipy==1.13.1
+ 
+# Monitoring
+tensorboard==2.17.0
+ 
+# Web dashboard (built-in http.server — no extra dep needed)
+ 
+# Optional: for Telegram (already using requests)
+# No extra needed
+ 
+# Data handling
+pandas==2.2.2
+ 
