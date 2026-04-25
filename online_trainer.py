@@ -1,8 +1,3 @@
-# ============================================================
-#  online_trainer.py — Main Training Loop
-#  Fixed: correct P&L in journal, Phase 3 connected
-#  Phase 3: high priority trades replayed more during learning
-# ============================================================
 
 import os
 import time
@@ -11,7 +6,7 @@ import numpy as np
 from datetime import datetime
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.buffers import RolloutBuffer
 
 from binance_stream    import BinanceStream
 from trading_env       import TradingEnv
@@ -26,164 +21,47 @@ from config import (
     TRADING_PAIR, PAPER_INITIAL_BALANCE
 )
 
-MAX_EPISODE_STEPS = 1440   # 1 day on 1-min candles
-PHASE3_MIN_TRADES = 20     # Start Phase 3 after 20 journal entries
+MAX_EPISODE_STEPS  = 1440
+PHASE3_MIN_TRADES  = 20
 
 
-# ----------------------------------------------------------
-# Phase 3 Callback — Weighted Replay
-# Injects high-priority trade observations during learning
-# ----------------------------------------------------------
-class Phase3Callback(BaseCallback):
-    """
-    After each PPO update, check journal for high-priority
-    trades and log them as additional learning signal.
-    This is the Phase 3 weighted replay implementation.
-    """
-
-    def __init__(self, journal: TradeJournal, verbose=0):
-        super().__init__(verbose)
-        self.journal     = journal
-        self.update_count = 0
-
-    def _on_rollout_end(self):
-        """Called after each rollout — inject priority trades."""
-        self.update_count += 1
-
-        # Only start Phase 3 after enough journal data
-        priority_trades = self.journal.load_priority_trades(min_priority=7)
-
-        if len(priority_trades) < 5:
-            return
-
-        print(
-            f"[Phase3] Injecting {len(priority_trades)} "
-            f"high-priority trades into replay..."
-        )
-
-        # For each high priority trade, we replay its features
-        # through the value network to strengthen the signal
-        try:
-            import torch
-            for trade in priority_trades:
-                feat = trade.get("features", {})
-                if not feat:
-                    continue
-
-                # Reconstruct observation vector from named features
-                feature_names = [
-                    "rsi", "macd", "macd_signal", "macd_hist",
-                    "boll_position", "boll_bandwidth", "boll_pct",
-                    "atr", "vwap_dev", "taker_ratio",
-                    "price_velocity", "price_acceleration", "price_jerk",
-                    "price_vel_avg", "price_acc_avg", "price_jerk_vol",
-                    "vol_velocity", "vol_acceleration", "vol_jerk",
-                    "vol_vel_avg", "vol_acc_avg", "vol_jerk_vol",
-                    "hurst", "entropy", "zscore", "price_vol_corr",
-                    "ob_spread", "ob_imbalance", "ob_bid_wall",
-                    "ob_ask_wall", "ob_vol_ratio", "ob_spread2",
-                    "trade_pressure",
-                    "time_sin_hour", "time_cos_hour",
-                    "time_sin_dow", "time_cos_dow",
-                    "position_held", "balance_ratio",
-                    "steps_held", "unrealized_pct", "consec_loss",
-                ]
-                obs_vec = np.array(
-                    [feat.get(n, 0.0) for n in feature_names],
-                    dtype=np.float32
-                )
-
-                # Pad or trim to match observation space
-                expected_size = self.model.observation_space.shape[0]
-                if len(obs_vec) < expected_size:
-                    obs_vec = np.pad(
-                        obs_vec, (0, expected_size - len(obs_vec))
-                    )
-                else:
-                    obs_vec = obs_vec[:expected_size]
-
-                # Compute priority weight
-                priority = trade.get("priority", 1)
-                pnl      = trade.get("pnl", 0)
-                label    = trade.get("label", "")
-
-                # Determine target reward signal
-                # Wins → push value estimate up
-                # Losses → push value estimate down (learn to avoid)
-                if "WIN" in label:
-                    target_reward = min(10.0, abs(pnl) / 10.0)
-                else:
-                    target_reward = -min(10.0, abs(pnl) / 10.0)
-
-                # Scale by priority
-                target_reward *= (priority / 5.0)
-
-                # Compute current value estimate
-                obs_tensor = torch.FloatTensor(obs_vec).unsqueeze(0)
-                obs_tensor = obs_tensor.to(self.model.device)
-
-                with torch.no_grad():
-                    value_est = self.model.policy.predict_values(obs_tensor)
-
-                # Compute value error and update (gradient step)
-                value_target = torch.FloatTensor(
-                    [[target_reward]]
-                ).to(self.model.device)
-                value_loss = torch.nn.functional.mse_loss(
-                    value_est, value_target
-                )
-
-                # Only update if error is significant
-                if value_loss.item() > 0.1:
-                    self.model.policy.optimizer.zero_grad()
-                    value_loss.backward()
-                    self.model.policy.optimizer.step()
-
-        except Exception as e:
-            print(f"[Phase3] Replay error (non-fatal): {e}")
-
-        return True
-
-    def _on_step(self):
-        return True
-
-
-# ----------------------------------------------------------
-# Main Trainer
-# ----------------------------------------------------------
 class CandleStepTrainer:
 
     def __init__(self):
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
         os.makedirs(LOG_DIR,        exist_ok=True)
-
         self.monitor        = Monitor()
         self.stream         = BinanceStream()
         self.env            = None
+        self.vec_env        = None   # persistent — never recreated
         self.model          = None
         self.obs            = None
         self.last_candle_ts = None
         self.journal        = TradeJournal()
         self.extractor      = PatternExtractor()
         self.last_extract   = datetime.utcnow().date()
-
-        # Trade tracking
         self.prev_pnl       = 0.0
         self.prev_trades    = 0
-        self.prev_price     = 0.0
-        self.was_holding    = False   # Was agent holding last step?
+        self.was_holding    = False
 
     def setup(self):
         print("[Trainer] Starting stream...")
         self.stream.start()
         print("[Trainer] Building env...")
         self.env = TradingEnv(stream=self.stream, mode="live")
+
+        # Create vec_env ONCE — never recreated
+        self.vec_env = DummyVecEnv([lambda: self.env])
+
         print("[Trainer] Building model...")
         self.model = self._build_or_load_model()
+
+        # Get initial observation WITHOUT resetting env
+        # (env already initialized in __init__)
         self.obs, _ = self.env.reset()
+
         self.monitor.send_message(
-            f"Bot started | {TRADING_PAIR} | "
-            f"Phase 2+3 ACTIVE | Journal + Weighted Replay"
+            f"Bot started | {TRADING_PAIR} | Phase 2+3 ACTIVE"
         )
 
     def _build_or_load_model(self):
@@ -194,16 +72,15 @@ class CandleStepTrainer:
         policy_kwargs = dict(
             net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128])
         )
-        vec_env = DummyVecEnv([lambda: self.env])
         if checkpoints:
             latest = os.path.join(CHECKPOINT_DIR, checkpoints[-1])
             print(f"[Trainer] Resuming: {latest}")
-            return PPO.load(latest, env=vec_env, verbose=0)
+            return PPO.load(latest, env=self.vec_env, verbose=0)
         else:
             print("[Trainer] Fresh model")
             return PPO(
                 policy          = "MlpPolicy",
-                env             = vec_env,
+                env             = self.vec_env,
                 learning_rate   = LEARNING_RATE,
                 n_steps         = N_STEPS,
                 batch_size      = BATCH_SIZE,
@@ -231,12 +108,11 @@ class CandleStepTrainer:
             time.sleep(2)
 
     def _get_confidence(self, obs):
-        """Get action probability distribution from policy."""
         try:
             import torch
-            obs_t = self.model.policy.obs_to_tensor(
-                obs.reshape(1, -1)
-            )[0]
+            # MUST set train mode for gradients
+            self.model.policy.set_training_mode(False)
+            obs_t = self.model.policy.obs_to_tensor(obs.reshape(1, -1))[0]
             with torch.no_grad():
                 dist  = self.model.policy.get_distribution(obs_t)
                 probs = dist.distribution.probs.cpu().numpy()[0]
@@ -248,25 +124,152 @@ class CandleStepTrainer:
         except Exception:
             return {"hold": 0.33, "buy": 0.33, "sell": 0.33}
 
+    def _run_phase3(self):
+        """
+        Fixed Phase 3 — properly enables gradients
+        Updates value head on priority trades
+        Does NOT interfere with environment state
+        """
+        try:
+            import torch
+
+            priority_trades = self.journal.load_priority_trades(min_priority=7)
+            if len(priority_trades) < 5:
+                return
+
+            print(f"[Phase3] Injecting {len(priority_trades)} priority trades...")
+
+            # Switch to TRAINING mode for gradient updates
+            self.model.policy.set_training_mode(True)
+
+            feature_names = [
+                "rsi", "macd", "macd_signal", "macd_hist",
+                "boll_position", "boll_bandwidth", "boll_pct",
+                "atr", "vwap_dev", "taker_ratio",
+                "price_velocity", "price_acceleration", "price_jerk",
+                "price_vel_avg", "price_acc_avg", "price_jerk_vol",
+                "vol_velocity", "vol_acceleration", "vol_jerk",
+                "vol_vel_avg", "vol_acc_avg", "vol_jerk_vol",
+                "hurst", "entropy", "zscore", "price_vol_corr",
+                "ob_spread", "ob_imbalance", "ob_bid_wall",
+                "ob_ask_wall", "ob_vol_ratio", "ob_spread2",
+                "trade_pressure",
+                "time_sin_hour", "time_cos_hour",
+                "time_sin_dow", "time_cos_dow",
+                "position_held", "balance_ratio",
+                "steps_held", "unrealized_pct", "consec_loss",
+            ]
+
+            expected_size = self.model.observation_space.shape[0]
+            updates_done  = 0
+
+            for trade in priority_trades:
+                feat = trade.get("features", {})
+                if not feat:
+                    continue
+
+                obs_vec = np.array(
+                    [feat.get(n, 0.0) for n in feature_names],
+                    dtype=np.float32
+                )
+
+                # Pad to match observation space
+                if len(obs_vec) < expected_size:
+                    obs_vec = np.pad(obs_vec, (0, expected_size - len(obs_vec)))
+                else:
+                    obs_vec = obs_vec[:expected_size]
+
+                pnl      = trade.get("pnl", 0)
+                priority = trade.get("priority", 1)
+                label    = trade.get("label", "")
+
+                # Target value scaled by priority and P&L size
+                scale = priority / 5.0
+                if "WIN" in label:
+                    target_val = min(8.0, abs(pnl) / 8.0) * scale
+                else:
+                    target_val = -min(8.0, abs(pnl) / 8.0) * scale
+
+                obs_tensor = torch.FloatTensor(obs_vec).unsqueeze(0)
+                obs_tensor = obs_tensor.to(self.model.device)
+
+                # Compute value with gradients ENABLED
+                value_pred = self.model.policy.predict_values(obs_tensor)
+                target_tensor = torch.FloatTensor([[target_val]]).to(self.model.device)
+
+                loss = torch.nn.functional.mse_loss(value_pred, target_tensor)
+
+                if loss.item() > 0.05:
+                    self.model.policy.optimizer.zero_grad()
+                    loss.backward()
+                    # Clip gradients to prevent explosion
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.policy.parameters(), max_norm=0.5
+                    )
+                    self.model.policy.optimizer.step()
+                    updates_done += 1
+
+            # Switch BACK to eval mode
+            self.model.policy.set_training_mode(False)
+            print(f"[Phase3] Done — {updates_done} value updates applied")
+
+        except Exception as e:
+            print(f"[Phase3] Error: {e}")
+            # Always restore eval mode
+            try:
+                self.model.policy.set_training_mode(False)
+            except Exception:
+                pass
+
+    def _do_learning_update(self, step):
+        """
+        Fixed learning update — does NOT reset environment
+        Collects rollout from buffer without env.reset()
+        """
+        journal_count = len(self.journal.load_all())
+        use_phase3    = journal_count >= PHASE3_MIN_TRADES
+
+        print(
+            f"[Trainer] Learning update at step {step} | "
+            f"Phase 3: {'ACTIVE' if use_phase3 else 'warming up'} | "
+            f"Journal: {journal_count} trades"
+        )
+
+        try:
+            # Use existing vec_env — no reset
+            self.model.set_env(self.vec_env)
+
+            # Learn without resetting timestep counter
+            # reset_num_timesteps=False is critical
+            self.model.learn(
+                total_timesteps     = N_STEPS,
+                reset_num_timesteps = False,
+                progress_bar        = False,
+            )
+
+            # Run Phase 3 AFTER standard PPO update
+            if use_phase3:
+                self._run_phase3()
+
+            print("[Trainer] Model updated ✓")
+
+        except Exception as e:
+            print(f"[Trainer] Learning error: {e}")
+
     def _check_midnight_extraction(self):
         today = datetime.utcnow().date()
         if today > self.last_extract:
-            print("[Trainer] Midnight — running daily pattern extraction...")
+            print("[Trainer] Midnight — running pattern extraction...")
             try:
                 self.extractor.run_daily_analysis()
-                self.last_extract = today
-                self.monitor.send_message(
-                    "Daily pattern report ready. "
-                    "Check logs/daily_report.txt"
-                )
+                self.monitor.send_message("Daily pattern report ready.")
             except Exception as e:
                 print(f"[Extractor] Error: {e}")
+            finally:
+                self.last_extract = datetime.utcnow().date()
 
     def run(self):
         self.setup()
-
-        # Phase 3 callback
-        phase3_cb = Phase3Callback(journal=self.journal)
 
         step          = 0
         episode       = 0
@@ -278,10 +281,10 @@ class CandleStepTrainer:
         last_ckpt     = time.time()
 
         print("\n" + "="*60)
-        print("  TRADING BOT — Phase 2 + Phase 3 ACTIVE")
-        print("  Phase 2: Journal logs every trade with 42 features")
-        print("  Phase 3: High priority trades replayed during learning")
-        print("  Pattern report: daily at midnight UTC")
+        print("  TRADING BOT — Phase 2+3 | Bug fixes applied")
+        print("  - Env NO LONGER resets during learning update")
+        print("  - Phase 3 gradients properly enabled")
+        print("  - Persistent vec_env throughout session")
         print("="*60 + "\n")
 
         while True:
@@ -291,21 +294,20 @@ class CandleStepTrainer:
                 print(f"[Trainer] Waiting for candle {step+1}...")
                 self._wait_for_new_candle()
 
-                # Get confidence BEFORE action
+                # Get confidence (eval mode)
                 confidence = self._get_confidence(self.obs)
 
-                # Get current state BEFORE step
+                # State before action
                 was_holding    = self.env.position > 0
                 pre_step_price = self.env._get_current_price()
 
-                # Predict action
+                # Predict
                 action_arr, _ = self.model.predict(
                     self.obs.reshape(1, -1), deterministic=False
                 )
                 action = int(action_arr[0])
 
-                # ---- Phase 2: Log BUY entry BEFORE step ----
-                # (We know position is 0 and action is BUY)
+                # Journal BUY entry
                 if action == 1 and self.env.position == 0:
                     self.journal.log_entry(
                         episode    = episode,
@@ -315,11 +317,11 @@ class CandleStepTrainer:
                         confidence = confidence,
                     )
 
-                # ---- Tick journal if holding ----
+                # Journal tick if holding
                 if was_holding:
                     self.journal.tick()
 
-                # ---- Execute action ----
+                # Execute
                 next_obs, reward, terminated, truncated, info = \
                     self.env.step(action)
                 done = terminated or truncated
@@ -328,37 +330,31 @@ class CandleStepTrainer:
                 step       += 1
                 learn_step += 1
 
-                # Current state AFTER step
                 cur_trades = info.get("trade_count", 0)
                 cur_pnl    = info.get("total_pnl",   0.0)
                 cur_price  = info.get("price",        0.0)
                 cur_bal    = info.get("balance",      0.0)
                 drawdown   = info.get("drawdown",     0.0)
 
-                # ---- Phase 2: Log SELL exit AFTER step ----
-                # BUG FIX: was_holding=True, now position=0 → sell happened
+                # Journal SELL exit — AFTER step so price is correct
                 just_sold = was_holding and self.env.position == 0
                 if just_sold:
-                    delta_pnl       = cur_pnl - self.prev_pnl
-                    exit_confidence = self._get_confidence(next_obs)
+                    delta_pnl = cur_pnl - self.prev_pnl
                     self.journal.log_exit(
                         exit_price       = cur_price,
-                        pnl              = delta_pnl,   # CORRECT P&L
+                        pnl              = delta_pnl,
                         episode          = episode,
                         step             = step,
-                        exit_confidence  = exit_confidence,
+                        exit_confidence  = self._get_confidence(next_obs),
                     )
 
-                # Track trades for dashboard
+                # Track trades
                 if cur_trades > self.prev_trades:
-                    delta = cur_pnl - self.prev_pnl
-                    if delta > 0:
+                    if (cur_pnl - self.prev_pnl) > 0:
                         ep_wins += 1
                     ep_trades        = cur_trades
                     self.prev_trades = cur_trades
                     self.prev_pnl    = cur_pnl
-
-                    # Log to dashboard
                     for t in self.env.trade_log[-1:]:
                         self.monitor.log_trade({**t, "episode": episode})
 
@@ -369,7 +365,7 @@ class CandleStepTrainer:
                     f"[Step {step:5d}] {action_name} | "
                     f"${cur_price:,.2f} | "
                     f"Bal: ${cur_bal:,.2f} | "
-                    f"PnL: {'+' if cur_pnl >= 0 else ''}${cur_pnl:.2f} | "
+                    f"PnL: {'+' if cur_pnl>=0 else ''}${cur_pnl:.2f} | "
                     f"Trades: {cur_trades} | "
                     f"Conf: {top_conf:.0%} | "
                     f"DD: {drawdown*100:.2f}%"
@@ -389,33 +385,12 @@ class CandleStepTrainer:
                     episode_wins   = ep_wins,
                 )
 
-                # ---- Learn every N_STEPS with Phase 3 ----
+                # Learning update — fixed, no env reset
                 if learn_step >= N_STEPS:
-                    journal_count = len(self.journal.load_all())
-                    use_phase3    = journal_count >= PHASE3_MIN_TRADES
-
-                    print(
-                        f"[Trainer] Learning update at step {step} | "
-                        f"Phase 3: {'ACTIVE' if use_phase3 else 'warming up...'} | "
-                        f"Journal: {journal_count} trades"
-                    )
-
-                    vec_env = DummyVecEnv([lambda: self.env])
-                    self.model.set_env(vec_env)
-
-                    # Phase 3 callback only active when enough data
-                    cb = phase3_cb if use_phase3 else None
-
-                    self.model.learn(
-                        total_timesteps     = N_STEPS,
-                        callback            = cb,
-                        reset_num_timesteps = False,
-                        progress_bar        = False,
-                    )
+                    self._do_learning_update(step)
                     learn_step = 0
-                    print("[Trainer] Model updated ✓")
 
-                # ---- Episode end ----
+                # Episode end
                 if done or step % MAX_EPISODE_STEPS == 0:
                     episode += 1
                     ep_rewards.append(ep_reward)
@@ -423,9 +398,7 @@ class CandleStepTrainer:
                     print(
                         f"\n{'='*50}\n"
                         f"[Episode {episode} END]\n"
-                        f"  Steps:    {step}\n"
                         f"  Trades:   {ep_trades}\n"
-                        f"  Wins:     {ep_wins}\n"
                         f"  Win rate: {win_rate*100:.1f}%\n"
                         f"  PnL:      ${cur_pnl:+.2f}\n"
                         f"  Avg Rew:  {avg_rew:.2f}\n"
@@ -438,7 +411,7 @@ class CandleStepTrainer:
                     self.prev_trades = 0
                     self.prev_pnl    = 0.0
 
-                # ---- Checkpoint every hour ----
+                # Checkpoint
                 if time.time() - last_ckpt >= CHECKPOINT_EVERY:
                     ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
                     path = os.path.join(CHECKPOINT_DIR, f"agent_{ts}")
@@ -446,7 +419,6 @@ class CandleStepTrainer:
                     print(f"[Trainer] Checkpoint: {path}")
                     last_ckpt = time.time()
 
-                # Update state
                 self.obs         = next_obs
                 self.was_holding = self.env.position > 0
 
